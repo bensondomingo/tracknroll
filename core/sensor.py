@@ -1,7 +1,6 @@
 import smbus, logging, pdb
 from threading import Lock
 from sys import stdout as sys_stdout
-from bluedot.btcomm import BluetoothServer
 from signal import pause
 
 # logging.basicConfig(
