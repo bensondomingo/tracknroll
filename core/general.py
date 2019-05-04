@@ -4,20 +4,21 @@ from sys import stdout as sys_stdout
 from time import sleep as delay
 from time import time as now
 from core.module import TimeoutExpired, CommandError
+from bcrypt import checkpw
 
 # logging.basicConfig(
 #     level=logging.DEBUG,
 #     format='%(asctime)s - %(levelname)s - %(message)s',
 #     handlers=[
-#         # logging.FileHandler('test.log'),
 #         logging.StreamHandler(sys_stdout)
 #     ]
 # )
 
+to10digit_num = lambda num: num[len(num)-10:len(num):1]
+
 def check_passw(pw, pw_hashed):
     # compares sms provided pw with hashed pw. returns
     # True if matched, false otherwise
-    from bcrypt import checkpw 
     return checkpw(pw.encode(), pw_hashed.encode())
     
 class ThreadMonitor(threading.Thread):
@@ -50,9 +51,7 @@ class Command():
     cmd_map = dict()
 
     def __init__(self, sms, pw_hashed):
-        logging.debug('Parsing sms ... ')
         self.parse(sms, pw_hashed)
-        logging.debug('Command is valid: {}'.format(self.is_valid))
 
     def parse(self, sms, pw_hashed):
         '''Parse command from the sms and set the command 
@@ -64,16 +63,23 @@ class Command():
             )
         '''
         # Check if sms body is a valid command
+        logging.debug(msg='Parsing sms ...')
         body = sms[len(sms)-1]  # body is the last element
-        body = body.split(' ')  # split pw, cmd, arg0, arg1, ... , argn
+        body = body.split(' ')  # split pw, cmd, kwarg0, kwarg1, ... , kwargn
         # A valid command must contain atleast a pw and cmd
         if len(body) < 2:       
             self.is_valid = False
+            logging.error(
+                msg='Invalid command! A valid command must contain atleast a pw and cmd.'
+            )
             return
         
         self.command = body[1]
         if self.command not in Command.cmd_map.keys():
             self.is_valid = False
+            logging.error(
+                msg='Unknown command: {}'.format(self.command)
+            )
             return
         
         pw = body[0]
@@ -83,6 +89,9 @@ class Command():
             return
         else:
             logging.info('Correct password!')
+        
+        # Get command sender number
+        self.sender = to10digit_num(sms[2])
 
         # Parse command arguments
         if len(body) > 2:
@@ -91,22 +100,7 @@ class Command():
             self.kwargs = tuple()
 
         self.is_valid = True
-
-    @property
-    def is_valid(self):
-        return self._is_valid
-
-    @is_valid.setter
-    def is_valid(self, val):
-        self._is_valid = bool(val)
-
-    @property
-    def command(self):
-        return self._command
-    
-    @command.setter
-    def command(self, cmd):
-        self._command = cmd
+        logging.info('Received a valid command: {}; args: {};'.format(self.command, self.kwargs))
 
     @property
     def kwargs(self):
@@ -125,23 +119,26 @@ class Command():
         self._kwargs = dict(      # SMS provided args
             [kv.split('=') for kv in kwargs]
         )
-        for k,v in self._kwargs.items():  # Convert string values like
+        for k,v in self._kwargs.items():  # Convert string values
             try:
                 self._kwargs[k] = eval(v)     # 'True' to True, 'False' to False
             except NameError:
                 pass    # skip non-evaluatable like string args
 
+        # Add sender on kwargs
+        self._kwargs['sender'] = self.sender
+
     def execute(self):
         # Run the command
-        logging.debug(
+        logging.info(
             msg='Executing {} command ...'.format(self.command)
         )
-        _exe = Command.cmd_map[self.command]
-        _tstart = now()
-        _exe(self.kwargs)
-        _exec_time = now() - _tstart
+        exe = Command.cmd_map[self.command]
+        tstart = now()
+        exe(self.kwargs)
+        exec_time = now() - tstart
         logging.debug(
-            msg='Execution finished! Exec time: {} s'.format(_exec_time)
+            msg='Execution finished! Exec time: {} s'.format(exec_time)
         )
 
 
@@ -335,7 +332,7 @@ class Vehicle():
     #         self.iot_thread.join()
     #         self._iot_feed = False
     #         logging.info('iot_feed thread stopped!')
-            
+        
 
 class OrientationMonitor(threading.Thread):
     def __init__(self, target, name, args=(), kwargs={}):
@@ -442,9 +439,7 @@ class IoTFeed(threading.Thread):
             kwargs=kwargs
         )
         self._stop_event = threading.Event()
-        self._tcp_commanderr_handler_counter = 0
-        self._tcp_timeouterr_handler_counter = 0
-
+        
     def start(self):
         logging.debug('Starting thread - {}'.format(self.name))
         super().start()
