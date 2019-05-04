@@ -1,4 +1,4 @@
-import logging, threading, os, json
+import logging, threading, os, json, pdb
 from sys import stdout as sys_stdout
 from core.sensor import MPU6050
 from core.general import Vehicle, Command, ThreadMonitor
@@ -8,22 +8,25 @@ from gpiozero import Button, LED
 # from bluedot.btcom import BluetoothServer
 from time import sleep as delay
 from time import time as now
+from pytz import utc, timezone
 from signal import pause
 
 # ==========================================================================================================
 # Setup Logging
 # ==========================================================================================================
 base_dir = os.path.dirname(os.path.abspath(__file__))
+log_file = os.path.join(base_dir, 'tracknroll.log')
+
 # Create log file if not exists
 if 'tracknroll.log' not in base_dir:
-    with open('tracknroll.log', 'w') as f:
+    with open(log_file, 'w') as f:
         pass
 
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(base_dir, 'tracknroll.log')),
+        logging.FileHandler(log_file),
         logging.StreamHandler(sys_stdout)
     ]
 )
@@ -40,26 +43,27 @@ def load_settings():
     with open(settings_file, 'r') as f:
         settings = json.load(f)
 
-def update_settings(new_settings, *args, **kwargs):
-    # 'num=+639051577637 pw=12345'
-    global settings, settings_file
-    # list of [key, value] pair
-    kv = [
-        setting.split('=')
-        for setting in new_settings.split()
-        if '=' in setting
-    ]
-    for settings_subsets in settings.keys():
-        for k,v in kv:
-            if settings[settings_subsets].get(k):
-                settings[settings_subsets].update({k: v})
-                break
-    with open(settings_file, 'w') as f:
-        json.dump(settings, f, indent=4)
-
-    load_settings() # Load global settings
+def _num_from_settings():
+    from base64 import b64decode
+    return b64decode(settings['security'].get('num')).decode()
 
 load_settings() # Load global settings
+
+# ==========================================================================================================
+# Date, Time, and Timezone management
+# ==========================================================================================================
+SYSTEM_TIME_UPDATED = False
+tz = timezone(settings['system'].get('timezone'))
+
+def update_system_time(source):
+    '''
+        update system time with accurate source time.
+        source -> utc localized datetime.datetime object (from GPS)
+    '''
+    global tz
+    dt_local = source.astimezone(tz).strftime('%c') # localize time
+    logging.info('Updating system time: {}'.format(dt_local))
+    os.system('date --set="{}"'.format(dt_local)) # use date cmd to update system time
 
 # ==========================================================================================================
 # Instantiation
@@ -75,7 +79,6 @@ motor = Vehicle(module=module, iot_server=ubidots, sensor=sensor)
 # ==========================================================================================================
 # Movement Sensing Implementation
 # ==========================================================================================================
-
 def msg_when_moved(*args, **kwargs):
     logging.info('Sending msg_when_move sms ...')
     # module.send_sms(
@@ -144,6 +147,8 @@ def when_moved(sms, iot, alarm, check_loc_delta, loc_delta_th, *args, **kwargs):
                 lng2=motor.park_loc.lng
             )
 
+            logging.info('Location change: {} meters.'.format(loc_delta))
+
             # if loc_delat > loc_delata_th, then the vehicle was moved
             if loc_delta >= loc_delta_th:
                 logging.info(
@@ -166,7 +171,9 @@ def when_moved(sms, iot, alarm, check_loc_delta, loc_delta_th, *args, **kwargs):
             logging.info('iot_feed is running. No need to run update_ubidots ...')
         else:
             logging.debug('Running iot_update function!')
-            update_ubidots(**settings.get('iot'))
+            readbk = update_ubidots(**settings.get('iot'))
+            if 'CLOSE' in readbk:
+                update_ubidots(**settings.get('iot'))
     
     logging.debug('when_moved routine done!')
 
@@ -219,8 +226,7 @@ def ms_dis(*args, **kwargs):
 # IoT server Update (ubidots.com/education)
 # ==========================================================================================================
 def update_ubidots(ua, token, dev_label, dev_name, var_name, ubi_tcp_body, gsmloc_backup, *args, **kwargs):
-    
-    # TODO: assemble tcp_packet
+    ''' Note: use this function only once GPS establish satellite fix '''
     context = ''
     temp = sensor.temp_read()
     gps_stat = module.gps_stat()
@@ -228,21 +234,30 @@ def update_ubidots(ua, token, dev_label, dev_name, var_name, ubi_tcp_body, gsmlo
     context += '$rssi=' + module.signal_strength()
     context += '$gps_stat=' + gps_stat
 
-    # _filter lambda func
-    _filter = lambda key: key in ('utc_time', 'stat', 'course', 'date', 'time')
     gps_data = motor.get_location(gsmloc_backup=False)
+    
+    # RPi system time update
+    global SYSTEM_TIME_UPDATED
+    if not SYSTEM_TIME_UPDATED:
+        update_system_time(source=gps_data._when)
+        SYSTEM_TIME_UPDATED = True
+
+     # _filter lambda func
+    _filter = lambda key: key in ('utc_time', 'stat', 'course', 'date', 'time', 'when', 'timestamp', 'lcode', '_when')
     if gps_data:
         for k,v in gps_data.__dict__.items():
             # filter data to reduce tcp_packet size ('utc_time', 'stat')
             if _filter(k):
                 continue    # do not add on context var
             context += '${}={}'.format(k, v)
+
+    timestamp_ms = gps_data.timestamp() * 1000  # timestamp in milliseconds
     
     # UA TOKEN DEV_LABEL VAR_NAME VAR_VAL CONTEXT TIMESTAMP
-    tcp_packet = ubi_tcp_body.format(ua, token, dev_label, var_name, temp, context, int(now())*1000)
+    tcp_packet = ubi_tcp_body.format(ua, token, dev_label, var_name, temp, context, timestamp_ms)
 
-    # TODO: sent tcp_packet
-    module.call_method(
+    # Sent tcp_packet
+    readbk = module.call_method(
         cmd=module.tcp_send,
         packet=tcp_packet,
         pre_reset=module.gprs_close,
@@ -252,6 +267,8 @@ def update_ubidots(ua, token, dev_label, dev_name, var_name, ubi_tcp_body, gsmlo
             'CommandError'      : te_handler,
         }
     )
+
+    return readbk
 
 def te_handler():
     logging.info('Running TimeoutExpired handler ...')
@@ -302,11 +319,92 @@ def iot_dis(*args, **kwargs):
     motor.iot_disable(*args, **kwargs)
 
 # ==========================================================================================================
+# Util Commands
+# ==========================================================================================================
+def get_stats(kwargs):
+    # Get device status
+    # temp, vbt_stat, gps_stat, 
+    temp = sensor.temp_read()
+    vbt = module.vbt_stat()
+    vbt_charging = vbt.is_charging
+    vbt_percent = vbt.percent
+    vbt_voltage = vbt.voltage
+    gps_pwr = module.gps_pwr
+    gps_stat = module.gps_stat()
+    gprs_stat = module.gprs_is_connected()
+
+    stat = '--- TrackNRoll Stats ---\n'
+    stat += 'temp: {}\n'.format(temp)
+    stat += 'vbt_charging: {}\n'.format(vbt_charging)
+    stat += 'vbt_percent: {}\n'.format(vbt_percent)
+    stat += 'vbt_voltage: {}\n'.format(vbt_voltage)
+    stat += 'gps_power: {}\n'.format(gps_pwr)
+    stat += 'gps_stat: {}\n'.format(gps_stat)
+    stat += 'network_reg: {}\n'.format(module.network_reg_stat())
+    stat += 'signal_strength: {}\n'.format(module.signal_strength())
+    stat += 'gprs_connected: {}'.format(gprs_stat)
+
+    if kwargs.get('rep_here'):
+        number = kwargs.get('sender')
+    else:
+        number = _num_from_settings()
+    number = '+63' + number
+
+    print(stat)
+    try:
+        module.send_sms(number=number, message=stat)
+    except Exception as e:
+        logging.error(msg=e.__str__())
+
+def get_settings(kwargs):
+    s = str()
+    with open(settings_file, 'r') as f:
+        for _ in f.readlines(): s += _
+    
+    if kwargs.get('rep_here'):
+        number = kwargs.get('sender')
+    else:
+        number = _num_from_settings()
+    number = '+63' + number
+
+    logging.debug('Sending settings to {}'.format(number))
+    # module.send_sms(number=number, message=s)
+
+def update_settings(kwargs):
+    # kwargs: dict. key-value pair of settings to update
+    global settings, settings_file
+
+    if kwargs.get('pw'):
+        from bcrypt import hashpw, gensalt
+        hashed_pw = hashpw(
+            kwargs.get('pw').encode(), 
+            gensalt()
+        )
+        kwargs['pw'] = hashed_pw.decode()
+
+    if kwargs.get('num'):
+        from core.general import to10digit_num
+        from base64 import b64encode
+        num = to10digit_num(kwargs.get('num'))
+        b64_num = b64encode(num.encode())
+        kwargs['num'] = b64_num.decode()
+
+    for settings_subsets in settings.keys():
+        for k,v in kwargs.items():
+            if k in settings[settings_subsets].keys():
+                settings[settings_subsets].update({k: v})
+
+    with open(settings_file, 'w') as f:
+        json.dump(settings, f, indent=4)
+
+# ==========================================================================================================
 # Top Levels
 # ==========================================================================================================
 Command.cmd_map = {
     'tr'    : motor.track,
-    # 'gs'    : get_stats,
+    'gst'   : get_stats,
+    'us'    : update_settings,
+    'gs'    : get_settings,
     'me'    : ms_en,
     'md'    : ms_dis,
     'ie'    : iot_en,
@@ -314,39 +412,11 @@ Command.cmd_map = {
 }
 
 def sms_command_manager(debug=False, sms=None):
-
-    # if debug and sms:
-    #     ''' For debugging only '''
-    #     logging.debug('sms_command_manager DEBUG call!')
-    #     command = Command(sms, pw_hashed=settings['security'].get('pw', ''))
-    #     if command.is_valid:
-    #         logging.info(
-    #             msg='Received a valid command: {} \t args: {}'.format(
-    #                 command.command, command.kwargs
-    #                 )
-    #         )
-    #         # Execute command
-    #         logging.debug('Running command execution thread ... ')
-    #         cmd_thread = threading.Thread(
-    #             target=command.execute,
-    #             name=command.command,
-    #         )
-    #         cmd_thread.daemon = True
-    #         cmd_thread.start()
-
-    #     else:
-    #         logging.error(
-    #             msg='Not a valid command {}'.format(' '.join(sms))
-    #         )
-
-    #     return
-
-
     # Get REC_UNREAD Messages
     logging.debug(msg='sms_command_manager thread running ...')
 
     if debug and sms:
-        unread_messages = (sms)
+        unread_messages = (sms,)
     else:
     # Need to run list_sms twice. Sometimes returns nothing
     # on first call even if an unread message exists.
@@ -371,15 +441,9 @@ def sms_command_manager(debug=False, sms=None):
     for sms in unread_messages:
         logging.debug(msg='Reading new message ... ')
         logging.debug(msg=' '.join(sms))
-        command = Command(sms)
+        command = Command(sms, pw_hashed=settings['security'].get('pw', ''))
         if command.is_valid:
-            logging.info(
-                msg='Received a valid command: {} \t args: {}'.format(
-                    command.command, command.kwargs
-                    )
-            )
             # Execute command
-            logging.debug('Running command execution thread ... ')
             cmd_thread = threading.Thread(
                 target=command.execute,
                 name=command.command,
@@ -389,7 +453,7 @@ def sms_command_manager(debug=False, sms=None):
 
         else:
             logging.error(
-                msg='Not a valid command {}'.format(' '.join(sms))
+                msg='Wrong password/command: {}'.format(' '.join(sms))
             )
 
         module.delete_sms(typ='READ')
@@ -427,5 +491,8 @@ if __name__ == '__main__':
 
     # Check for unread messages
     sms_command_manager()
-    
+
+    sms_me_warg = ('1', 'REC UNREAD', '09051577637', 'now', 'now', '1234 me check_loc_delta=True iot=True alarm=False')
+    sms_command_manager(debug=True, sms=sms_me_warg)
+
     pause()
