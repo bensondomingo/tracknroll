@@ -1,1 +1,7 @@
 settings.json
+tracknroll.log
+virtualenv
+.vscode
+__pycache__
+thread_monitor.py
+*.log
