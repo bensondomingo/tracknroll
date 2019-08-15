@@ -7,3 +7,4 @@ thread_monitor.py
 *.log
 ms_test.py
 rt.json
+*.code-workspace
