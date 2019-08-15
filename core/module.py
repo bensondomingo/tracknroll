@@ -79,27 +79,51 @@ class InactiveMonitor(Thread):
 
 class SimModule(Serial):
     
-    def __init__(self, port, timeout=5, baudrate=9600, power_monitor=False, gprs_inactive_timo=None, *args, **kwargs):
+    def __init__(self, port, timeout=5, baudrate=9600, stat_pin=None, pkey_pin=None, gprs_inactive_timo=None, *args, **kwargs):
+        '''
+            port: str. port where module was connected i.e /dev/ttySx
+            timeout: int. uart readback timeout
+            baudrate: int. baudrate, see module docs
+            stat_pin: gpiozero.Button. RPi pin where stat pin is connected
+            pkey_pin: gpiozero.OutputDevice. RPi pin where pkey pin is connected
+            gprs_inactive_timo: int. If given a value, module GPRS connection will be
+                                terminated if unused for gprs_inactive_timo minutes. This
+                                is to conserve module power consumption.
+        '''
         super().__init__(port=port, timeout=timeout, baudrate=baudrate)
         self.uart_lock = RLock()
         self._gprs_last_used_lock = RLock()
         self.gprs_inactive_timo = gprs_inactive_timo
 
-        if power_monitor and kwargs.get('pkey_pin') and kwargs.get('stat_pin') :
-            self._pkey_pin = kwargs['pkey_pin']
-            self._stat_pin = kwargs['stat_pin']
-            # Power UP module if not powered up
-            self.power = True
-            self.power_monitor = True
-            # logging.debug('power_monitor: {}'.format(self.power_monitor))
-            # logging.debug('_when_released: {}'.format(self._stat_pin.when_released.__name__))
+        # If connected to RPi pin resources
+        if pkey_pin and stat_pin:
+            self.pkey_pin = pkey_pin
+            self.stat_pin = stat_pin
+            self.power = 1  # Power up module
+            with self.uart_lock:
+                self.call_method(cmd=self._synchronize) # Sync UART
+                # Wait for network connection
+                while True:
+                    if self.call_method(cmd=self.network_reg_stat):
+                        break
+                    delay(2)
+                self.read_module_info() # read module information.
         else:
-            self.power_monitor = False
-
-        self.initialize()
+            self.stat_pin = None
+            self.pkey_pin = None
 
     def __str__(self):
+        self.read_module_info()
         return ' '.join(self.module_info)
+
+    def close(self):
+        try:
+            self.stat_pin.close()
+            self.pkey_pin.close()
+        except AttributeError:
+            pass
+        finally:
+            super().close()
 
     @staticmethod
     def dm_to_dd(dm):   # coordinate conversion to decimal digits
@@ -139,17 +163,6 @@ class SimModule(Serial):
             
         return str(_rssi) + ' dBm'
 
-    def close(self):
-        try:
-            is_conn = self.gprs_is_connected()
-        except AttributeError:
-            pass
-        else:
-            if is_conn:
-                self.gprs_close()
-        finally:
-            super().close()
-
     def vbt_stat(self):
         logging.debug('Reading VBAT status ...')
         cmd = 'at+cbc'
@@ -166,33 +179,41 @@ class SimModule(Serial):
 
     @property
     def vbt_charge(self):
-        return self._vbt_charge
-    
+        cmd = 'at+echarge?'
+        readbk = self.write_cmd(cmd=cmd)
+        err_check(readbk, cmd)
+        # parse ECHARGE value
+        echarge = readbk[0].replace('+ECHARGE: ', '')
+        return int(echarge)
+
     @vbt_charge.setter
     def vbt_charge(self, val):
         if val != 0:
-            self._vbt_charge = 1
             logging.info('Enable battery charging ...')
         else:
-            self._vbt_charge = 0
             logging.info('Disable battery charging ...')
         
-        cmd = 'at+echarge={}'.format(self._vbt_charge)
+        cmd = 'at+echarge={}'.format(val)
         readbk = self.write_cmd(cmd=cmd)
         err_check(readbk, cmd)
 
     def _toggle_pkey(self):
-        self._pkey_pin.on()
+        if not self.pkey_pin:
+            raise NotImplementedError('pkey_pin is required!')
+        self.pkey_pin.on()
         delay(1.5)
-        self._pkey_pin.off()
+        self.pkey_pin.off()
 
     @property
     def power(self):
-        return self._stat_pin.is_active
+        if not self.stat_pin:
+            raise NotImplementedError('stat_pin is required!')
+        return self.stat_pin.is_active
 
     @power.setter
     def power(self, value):
-        # pdb.set_trace()
+        if not (self.stat_pin and self.pkey_pin):
+            raise NotImplementedError('stat_pin and pkey_pin is required!')
         if value:
             if self.power:
                 return
@@ -203,6 +224,8 @@ class SimModule(Serial):
         self._toggle_pkey()
         
     def power_reset(self):
+        if not (self.stat_pin and self.pkey_pin):
+            raise NotImplementedError('stat_pin and pkey_pin is required!')
         logging.debug('Performing power reset ...')
         if not self.power:  # if powered down
             self.power = 1  # power up
@@ -212,24 +235,45 @@ class SimModule(Serial):
 
     @property
     def power_monitor(self):
+        if not (self.stat_pin and self.pkey_pin):
+            raise NotImplementedError('stat_pin and pkey_pin is required!')
         return self._power_monitor
     
     @power_monitor.setter
     def power_monitor(self, value):
+        '''
+        If True, will try to keep module powered up by monitoring stat_pin change and 
+        toggling pkey_pin to power up module. Can only be set if stat_pin and pkey_pin
+        is provided.
+        '''
+        if not (self.stat_pin and self.pkey_pin):
+            raise NotImplementedError('stat_pin and pkey_pin is required!')
 
         if not value:
-            self._stat_pin.close()
-            self._pkey_pin.close()
-            self._power_monitor = False
+            self.stat_pin.when_released = None
         else:
-            # for attr in []
-            self._stat_pin.when_released = self.initialize
-            self._power_monitor = True
+            if not self.power:
+                self._power_interrupted_handler()
+            self.stat_pin.when_released = self._power_interrupted_handler
+
+        self._power_monitor = value
+    
+    @property
+    def init_procedure(self):
+        return self._init_procedure
+
+    @init_procedure.setter
+    def init_procedure(self, func):
+        ''' 
+        func: A function to call as module initialization procedure. Must
+        not accept arguments.
+        '''
+        self._init_procedure = func
 
     def _power_interrupted_handler(self):
         logging.critical(msg='Power interrupted! Powering module ...')
-        self.initialize()
-
+        self.power = 1 # Turn on module
+        self.init_procedure() # Run initialization procedure
 
     def call_method(self, cmd, max_try=10, dly=2, e_handler={}, pre_reset=None, post_reset=None, *args, **kwargs):
         try_count = 0
@@ -292,7 +336,7 @@ class SimModule(Serial):
                 delay(5)
 
             # 3. Module information
-            self._module_info()
+            self.read_module_info()
 
     def _synchronize(self):
         logging.debug('Synchronizing module ...')
@@ -304,7 +348,7 @@ class SimModule(Serial):
         logging.debug('Sync: {}'.format(' '.join(readbk)))
         err_check(readbk, cmd)
     
-    def _module_info(self):
+    def read_module_info(self):
         cmd = 'at+gsv'
         readbk = self.write_cmd(cmd=cmd)
         err_check(readbk, cmd)
@@ -327,7 +371,7 @@ class SimModule(Serial):
         cmd = 'at+cnum'
         readbk = self.write_cmd(cmd=cmd)
         err_check(readbk, cmd)
-        num_regex = regex_compile(r'\d{9}')
+        num_regex = regex_compile(r'\d{12}')
         num = num_regex.search(readbk[0])
         num = num.group()
 
@@ -421,7 +465,7 @@ class SimModule(Serial):
 
     ''' -------------------- SMS Methods -------------------- '''
     
-    def send_sms(self, number, message):
+    def send_sms(self, number, message, reset_when_err=True):
         '''
         Send SMS message to the number provided. Returns 'OK' if send
         successfully. 'SEND FAIL' otherwise.
@@ -439,9 +483,14 @@ class SimModule(Serial):
 
             if not readbk:  # Causes thread to block. Reset module to recover
                 logging.error('expecting \'>\' but got empty readbk on send_sms. Reset module to recover.')
-                self.power_reset()
-                self.initialize()
-                readbk = () # let the caller handle the exception raised by err_check
+                
+                if reset_when_err:
+                    if self.power_monitor:
+                        self.power_reset()
+                    if self.init_procedure:
+                        self.init_procedure()
+                    readbk = () # let the caller handle the exception raised by err_check
+
             err_check(readbk, cmd)
 
             readbk = self.write_cmd(
@@ -697,7 +746,7 @@ class SimModule(Serial):
             err_check(readbk=readbk, cmd=cmd)
         # return readbk[1]
 
-    def tcp_send(self, packet):
+    def tcp_send(self, packet, reset_when_err=True):
         self._gprs_last_used = now()
         logging.debug('Sending packet to TCP Server: %s' %packet)
         _resp = ('SEND OK', 'SEND FAIL', 'CME ERROR', 'ACCEPT', 'CLOSE')
@@ -709,9 +758,14 @@ class SimModule(Serial):
             logging.debug('readbk: {}'.format(readbk))
             if not readbk:  # Causes thread to block. Reset module to recover
                 logging.error('expecting \'>\' but got empty readbk on send_tcp. Reset module to recover.')
-                self.power_reset()
-                self.initialize()
-                readbk = () # let the caller handle the exception raised by err_check
+                
+                if reset_when_err:
+                    if self.power_monitor:
+                        self.power_reset()
+                    if self.init_procedure:
+                        self.init_procedure()
+                    readbk = () # let the caller handle the exception raised by err_check
+
             err_check(readbk=readbk, cmd=cmd)
 
             readbk = self.write_cmd(
@@ -763,25 +817,25 @@ class SimModule(Serial):
         # get <data> on readbk. readbk = (<data>, <OK>)
         gsm_loc = readbk[0].split(',')
         lcode = gsm_loc[0].replace('+CIPGSMLOC: ', '')
+        if lcode != '0': stat = False
+        else: stat = True
+        
         try:
             gps_data = GSMLocData(
                 {
                     'lcode' : lcode,
+                    'stat'  : stat,
                     'lng'   : gsm_loc[1],
                     'lat'   : gsm_loc[2],
                     'date'  : gsm_loc[3],
                     'time'  : gsm_loc[4],
                 }
             )
-        except IndexError as e:
+        except IndexError:
             # logging.error(e.__str__())
-            gps_data = GSMLocData(
-                {
-                    'lcode' : lcode
-                }
-            )
+            gps_data = GSMLocData({'lcode': lcode, 'stat': stat})
         
-        gps_data.provider = 'NETWORK'
+        # gps_data.provider = 'NETWORK'
         return gps_data
 
 
@@ -789,15 +843,16 @@ class SIM808(SimModule):
 
     @staticmethod
     def parse_gprmc(gps_string):
-        raw = gps_string.split(',')
+        raw = gps_string.split(',')                     # date, time
+        # dt = utc.localize(datetime.strptime(' '.join([raw[1], raw[9]]), '%H%M%S.sss %d%m%y'))
         gprmc_dict = {
-            'time'      :   raw[1], # Will be replaced by 'when' attribute
+            'time'      :   raw[1],
             'stat'      :   raw[2],
             'lat'       :   SimModule.dm_to_dd(raw[3]),
             'lng'       :   SimModule.dm_to_dd(raw[5]),
             'speed'     :   '%d kph' % (float(raw[7]) * 1.852),
             'course'    :   raw[8],
-            'date'      :   raw[9],  # Will be replaced by 'when' attribute
+            'date'      :   raw[9]
         }
 
         return gprmc_dict
@@ -898,10 +953,8 @@ class SIM808(SimModule):
         readbk = readbk.replace('+CGPSINF: ', '')
 
         if inf == 32:
-            gps_data = GPRMCData(
-                gps_data=SIM808.parse_gprmc(gps_string=readbk)
-            )
-            gps_data.provider = 'GPS'
+            gps_data = GPRMCData(gps_data=SIM808.parse_gprmc(gps_string=readbk))
+            # gps_data.provider = 'GPS'
 
         return gps_data
 
@@ -949,37 +1002,65 @@ class SMS():
 
 
 class GPSData():
-    # Always check is_valid first before working with the gps objects
-    
+    ''' Base class for GPS objects '''
     def __init__(self, gps_data):
         for k, v in gps_data.items():
             setattr(self, k, v)
-        
-        # Will have a value if is_valid = True
-        self.when = None
-        self.timestamp = None
 
     def __str__(self):
         return self.__dict__.__str__()
 
-    def is_valid(self, gps_data):
-        pass
+class GPSDataWithDateTime(GPSData):
+    ''' GPS objects with date and time information. Useful for timekeeping '''
+    def __init__(self, gps_data):
+        super(GPSDataWithDateTime, self).__init__(gps_data=gps_data)
+        self.is_valid = self.stat
+
+    def __str__(self):
+        if not self.is_valid:
+            return ' '.join([self.provider, '- No valid data!'])
+        
+        return ' - '.join(map(str, (self.provider, self.when, self.lat, self.lng)))
 
     @property
-    def when(self):
-        ''' return string UTC time '''
-        return self._when.strftime('%c %Z')
-    
-    @when.setter
-    def when(self, dt):
-        ''' dt: datetime instance formatted from GPS data '''
-        self._when = dt
+    def is_valid(self):
+        return self._is_valid
 
-class GPRMCData(GPSData):
+    @is_valid.setter
+    def is_valid(self, stat):
+        self._is_valid = stat
+        delattr(self, 'stat')
+    
+    @property
+    def when(self):
+        if not self._when:
+            return self._when
+        return self._when.strftime('%c %Z')
+
+    @when.setter
+    def when(self, dt_str):
+        try:
+            if self.provider == 'GPS':
+                self._when = utc.localize(datetime.strptime(dt_str, '%d%m%y %H%M%S.%f'))
+            elif self.provider == 'NETWORK':
+                self._when = utc.localize(datetime.strptime(dt_str, '%Y/%m/%d %H:%M:%S'))
+            else:
+                pass    # other providers
+            if self._when.year < 2019:
+                self._when = None
+        except ValueError as e:
+            self._when = None
+            logging.error(msg=e.__str__() + ' GPS string has no valid date and time data!')
+            raise ValueError(e.__str__() + ' GPS string has no valid date and time data!')
+        finally:
+            delattr(self, 'date')
+            delattr(self, 'time')
+    
+class GPRMCData(GPSDataWithDateTime):
     def __init__(self, gps_data, *args, **kwargs):
+        self.provider = 'GPS'
         super(GPRMCData, self).__init__(gps_data=gps_data)
-        self.is_valid = self.stat
-        self.__delattr__('stat') # remove stat. replaced by is_valid
+        self.when = ' '.join([self.date, self.time])
 
     @property
     def is_valid(self):
@@ -989,48 +1070,38 @@ class GPRMCData(GPSData):
     def is_valid(self, stat):
         if stat == 'A':
             self._is_valid = True
-            self.time = self.time.split('.')[0]
-            self.when = utc.localize(
-                datetime.strptime(
-                    '{} {}'.format(self.date, self.time),
-                    '%d%m%y %H%M%S'
-                )
-            )
-            self.timestamp = self._when.timestamp()
-            # Delete 'date' and 'time' attributes
-            self.__delattr__('date')
-            self.__delattr__('time')
-
         else:
             self._is_valid = False
-            self.__delattr__('when')
-
+        delattr(self, 'stat')
         
-class GSMLocData(GPSData):
+    # @property
+    # def when(self):
+    #     if not self._when:
+    #         return None
+    #     return self._when.strftime('%c %Z')
+
+    # @when.setter
+    # def when(self, dt_str):
+    #     try:
+    #         self._when = utc.localize(datetime.strptime(dt_str, '%d%m%y %H%M%S.%f'))
+    #         if self._when.year < 2019:
+    #             self._when = None
+    #     except ValueError as e:
+    #         self._when = None
+    #         logging.error(msg=e.__str__() + ' GPS string has no valid date and time data!')
+    #         raise ValueError(e.__str__() + ' GPS string has no valid date and time data!')
+    #     finally:
+    #         delattr(self, 'date')
+    #         delattr(self, 'time')
+
+class GSMLocData(GPSDataWithDateTime):
     def __init__(self, gps_data, *args, **kwargs):
+        self.provider = 'NETWORK'
         super(GSMLocData, self).__init__(gps_data)
-    
-    @property
-    def is_valid(self):
-        return self._is_valid
-    
-    @is_valid.setter
-    def is_valid(self, lcode):
-        if lcode != '0':
-            self._is_valid = False
-            self.__delattr__('when')
+        if self.is_valid:
+            self.when = ' '.join([self.date, self.time])
         else:
-            self._is_valid = True
-            self.when = utc.localize(
-                datetime.strptime(
-                    '{} {}'.format(self.date, self.time),
-                    '%Y/%m/%d %H:%M:%S %z'
-                )
-            )
-            self.timestamp = self.when.timestamp()
-            # Delete 'date' and 'time' attributes
-            self.__delattr__('date')
-            self.__delattr__('time')
+            self._when = None
 
 
 class CommandError(Exception):
@@ -1056,82 +1127,5 @@ class TimeoutExpired(Exception):
 
 """ -------------------- Test Codes ---------------------- """
 
-# s = SIM808(port='COM4')
-# s.gprs_profile = GPRSProfile(cid=1, apn='internet.globe.com.ph')
-# ubidots = TCPServer('things.ubidots.com', 9012)
-
-# def close_network_connection():
-
-#     # if connected, close gprs connection
-#     if s.gprs_is_connected():
-#         logging.debug('Closing GPRS')
-#         try:
-#             s.gprs_close()
-#         except CommandError as e:
-#             logging.error(msg=e.__str__())
-
-#     if s.tcp_is_connected():
-#         logging.debug('Closing TCP')
-#         try:
-#             s.tcp_close()
-#         except CommandError as e:
-#             logging.error(msg=e.__str__())
-
-# tcp_packet = '''SIM808_test|POST|A1E-YAmgm46yp3XrCtoYWou3dd8pcwfGYU|\
-# raspberrypi=>temp:{}|end'''.format(randint(24, 27))
-
-# def initialize():
-#     # Close any existing connection
-#     close_network_connection()
-
-
-# if __name__ == '__main__':
-
-#     pass
-
-    # index = 1
-
-    # while True:
-    #     msg = s.read_sms(index=index)
-    #     if not msg:
-    #         break
-    #     for _ in msg:
-    #         print(_)
-    #     print()
-    #     index += 1
-
-
-    # import time
-
-    # t1 = time.time()
-    # loop_count = 0
-    # while True:
-    #     duration = time.time() - t1
-    #     loop_count += 1
-
-    #     logging.debug(msg='Loop count: {} | TCP status: {} | Duration: {}'
-    #                   .format(loop_count, s.tcp_status(), duration))
-
-    #     try:
-    #         s.tcp_connect(ubidots)
-    #     except CommandError as e:
-    #         logging.error(msg=e.__str__())
-        
-    #     delay(2.5)
-
-    #     try:
-    #         s.tcp_send(tcp_packet)
-    #     except CommandError as e:
-    #         logging.error(msg=e.__str__())
-        
-    #     delay(2.5)
-
-    #     try:
-    #         s.tcp_close()
-    #     except CommandError as e:
-    #         logging.error(msg=e.__str__())
-        
-    #     print('\n')
-    #     delay(5)
-    
-    # logging.error(msg='Total duration: {}'.format(time.time() - t1))
+if __name__ == '__main__':
+    pass

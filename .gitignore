@@ -5,3 +5,5 @@ virtualenv
 __pycache__
 thread_monitor.py
 *.log
+ms_test.py
+rt.json

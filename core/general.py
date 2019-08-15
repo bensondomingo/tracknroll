@@ -20,7 +20,135 @@ def check_passw(pw, pw_hashed):
     # compares sms provided pw with hashed pw. returns
     # True if matched, false otherwise
     return checkpw(pw.encode(), pw_hashed.encode())
+
+
+class StopableThread(threading.Thread):
+    def __init__(self, name, target=None, t_delay=1, args=(), kwargs={}):
+        ''' 
+            name: thread name
+            target: target function. Must return boolean value. Thread will
+                    stop when target function returns True
+            t_delay: target function call interval in seconds
+            args: target function arguments
+            kwargs: target function keyword arguments
+        '''
+        super(StopableThread, self).__init__(
+            name=name,
+            args=args,
+            kwargs=kwargs
+        )
+        self.target_func = target
+        self.t_delay = t_delay
+        self._stop_event = threading.Event()
+
+    def start(self):
+        logging.debug('Starting thread - {}'.format(self.name))
+        super().start()
+
+    def stop(self):
+        logging.debug('Stopping thread - {}'.format(self.name))
+        self._stop_event.set()
+
+    def stopped(self):
+        return self._stop_event.is_set()
+            
+    def run(self):
+        while not self.stopped():
+            ''' Loop until target_func returns True ''' 
+            stop_thread = self.target_func(*self._args, **self._kwargs)
+            if stop_thread:
+                self.stop()
+                continue
+            delay(self.t_delay)
+
+
+class MovementSense(StopableThread):
+    def __init__(self, name, sensor, th, target=None, samples=10, t_delay=10, args=(), kwargs={}):
+        super(MovementSense, self).__init__(name=name, target=target, args=args, kwargs=kwargs)
+        self.sensor = sensor
+        self.threshold = th
+        self.samples = samples
+        self.t_delay = t_delay
+        self.position = None
+
+    def _gyro_average(self, samples=10):
+        logging.debug('Getting gyro average reading ...')
+        gyro_x_samples = list()
+        gyro_y_samples = list()
+        gyro_z_samples = list()
+
+        for i in range(samples):
+            while not self.sensor.data_ready:
+                pass
+
+            gyro_x_samples.append(self.sensor.gyro_read(axis='X'))
+            gyro_y_samples.append(self.sensor.gyro_read(axis='Y'))
+            gyro_z_samples.append(self.sensor.gyro_read(axis='Z'))
+            self.sensor.data_ready = False
+            self.sensor.INT_clear()
+
+        gyro_x_ave = sum(gyro_x_samples)/samples
+        gyro_y_ave = sum(gyro_y_samples)/samples
+        gyro_z_ave = sum(gyro_z_samples)/samples
+        logging.debug('Gyro Average -> X: {} \t Y: {} \t Z: {}'\
+            .format(gyro_x_ave, gyro_y_ave, gyro_z_ave))
+        return gyro_x_ave, gyro_y_ave, gyro_z_ave
+
+    def check_position(self, old_pos):
+        pass
     
+    def _run(self):
+        pass
+
+
+    def run(self):
+        # Get settings
+        # self.sensor             = self._kwargs['sensor']
+        # actions to do when when_moved fires
+        sms                     = self._kwargs.get('sms')   # Send SMS
+        iot                     = self._kwargs.get('iot')   # Enable iot
+        alarm                   = self._kwargs.get('alarm')
+        # movement sensing settings
+        when_moved              = self._kwargs.get('callback')
+        # iot settings
+        check_loc_delta         = self._kwargs.get('check_loc_delta')
+        loc_delta_th            = self._kwargs.get('loc_delta_th')
+        
+        gyro_current = self._gyro_average(samples=self.samples)
+        
+        logging.debug(msg='Entering Movement monitoring ...')
+        while not self.stopped():
+            
+            if not self.sensor.data_ready:
+                continue
+
+            gyro_new = self.sensor.gyro_read()
+            for i in range(3):
+                if abs(gyro_new[i]-gyro_current[i]) > self.threshold:
+                    logging.debug(msg='----- Sensed movement! -----')
+
+                    # Call when_when moved function
+                    when_moved(
+                        sms=sms,
+                        iot=iot,
+                        alarm=alarm,
+                        check_loc_delta=check_loc_delta,
+                        loc_delta_th=loc_delta_th
+                    )
+                    # TODO: Add exception handling 
+                    delay(self.t_delay)
+
+                    logging.debug(msg='---- Getting new samples ---')
+                    gyro_new = self._gyro_average(samples=self.samples)
+                    break # Exit from for loop
+            
+            self.sensor.data_ready = False
+            self.sensor.INT_clear()
+
+        logging.debug(msg='Exiting from Movement monitoring ...')
+        self._stop_event.clear()
+    
+
 class ThreadMonitor(threading.Thread):
     def __init__(self, *args, **kwargs):
         # Get all running Threads
@@ -149,13 +277,35 @@ class Vehicle():
         self.module = module
         self.sensor = sensor
 
-        self.iot_server = iot_server
+        self.iot_server     = iot_server
         self.ms_thread      = None  # thread for movement sensing
         self.iot_thread     = None  # thread for iot
         self.park_loc       = None
 
+        self.ms_settings = None
+        self.iot_settings = None
         self.movement_sense = False
         self.iot_feed = False
+
+    @property
+    def movement_sense(self):
+        return self._movement_sense
+
+    @movement_sense.setter
+    def movement_sense(self, value):    
+        '''
+            Current of movement sensing feature. True if enabled,
+            False otherwise.
+            value: tuple/bool. Assign False to set movement_sense
+            attribute False, Assign tuple (True, ms_settings_dict)
+            to set it to True
+        '''
+        try:
+            self._movement_sense = value[0] # Bool
+            self.ms_settings = value[1]     # Dict
+        except TypeError:
+            self._movement_sense = value
+            self.ms_settings = None
 
     def get_location(self, gsmloc_backup=True):
         ''' Use GPS provided data if available. If gsmloc_backup=True, 
@@ -183,20 +333,21 @@ class Vehicle():
                     loc = self.module.gsm_loc()
                 except Exception as e:
                     logging.error(msg=e.__str__())
-                    return False
+                    return None
             else:
-                return False
+                return None
         else:
             # Use more accurate GPS engine
             loc = self.module.gps_data()
 
         return loc
     
-    def track(self):
-        # Send location to the user through SMS/BT
+    def track(self, settings):
+        # Send location to the user through SMS
+        settings.get('gsmloc_backup')
         msg = str()
         logging.debug(msg='Tracking vehicle location ... ')
-        loc = self.get_location()
+        loc = self.get_location(gsmloc_backup=settings.get('gsmloc_backup'))
 
         if not loc:
             _msg = 'No GPS data source available!'
@@ -211,7 +362,7 @@ class Vehicle():
                     msg='lat: {}; \t lng:{}'.format(loc.lat, loc.lng)
                 )
                 msg += 'https://maps.google.com/?q={},{}\n'.format(loc.lat, loc.lng)
-                msg += 'when: {},{}\n'.format(loc.time, loc.date)
+                msg += 'when: {}\n'.format(loc.when)
             else:
                 _msg = 'No valid GPS data available'
                 logging.error(msg=_msg)
@@ -223,8 +374,11 @@ class Vehicle():
         
         # append other data here:
         logging.info('Sending data: {}'.format(msg))
-        delay(4) # self.module.send_sms(number, msg)
-        logging.info('Sent!')
+        try:
+            self.module.send_sms(number, msg)
+            logging.info('Sent!')
+        except Exception as e:
+            logging.error(msg=e.__str__())
         
     def ms_enable(self, settings):
         ''' Launch OrientationMonitor thread to sense movement '''
@@ -282,56 +436,6 @@ class Vehicle():
         self.iot_thread.join()
         self.iot_feed = False
         logging.info('iot_feed thread stopped!')
-
-    # @property
-    # def iot_feed(self):
-    #     return self._iot_feed
-
-    # @iot_feed.setter
-    # def iot_feed(self, value):
-    #     # pdb.set_trace()
-    #     value = bool(value)
-
-    #     # get iot_feed value
-    #     try:
-    #         is_running = self.iot_feed
-    #     except AttributeError as e:
-    #         logging.error(msg=e.__str__() + '. First run.')
-    #         is_running = False
-
-    #     if value:
-    #         # Enable movement sensing
-    #         if is_running:
-    #             logging.info('iot_feed is currently running.')
-    #             return
-
-    #         # Setup module and run the iot_feed thread
-    #         logging.info('Starting iot_feed thread ...')
-    #         self.iot_thread = IoTFeed(
-    #             target  = None,
-    #             name    = 'iot_feed',
-    #             kwargs  = {
-    #                 'module'        : self.module,
-    #                 'tcp_server'    : self.iot_server,
-    #                 'sensor'        : self.sensor,
-    #                 'get_loc_func'  : self.get_location
-    #             }
-    #         )
-    #         self.iot_thread.start()
-    #         self._iot_feed = True
-    #         logging.info('iot_feed thread successfully started!')
-        
-    #     else:
-    #         # Disable iot_feed
-    #         if not is_running:
-    #             logging.info('iot_feed is not currently running.')
-    #             return
-            
-    #         logging.info('Stopping iot_feed thread')
-    #         self.iot_thread.stop()
-    #         self.iot_thread.join()
-    #         self._iot_feed = False
-    #         logging.info('iot_feed thread stopped!')
         
 
 class OrientationMonitor(threading.Thread):
@@ -450,77 +554,6 @@ class IoTFeed(threading.Thread):
 
     def stopped(self):
         return self._stop_event.is_set()
-
-    # def _tcp_timeouterr_handler(self):
-    #     logging.info('Running TimeoutExpired handler ...')
-
-    #     if not self.module.gprs_is_connected():
-    #         self.module.gprs_connect()
-        
-    #     # Reset TCP connection
-    #     try:
-    #         self.module.tcp_close()
-    #     except Exception as e:
-    #         logging.error(msg=e.__str__())
-
-    #     try:
-    #         self.module.tcp_connect(self.tcp_server)
-    #     except Exception as e:
-    #         logging.error(msg=e.__str__())
-        
-        # try:
-        #     self.module.tcp_close()
-        # except CommandError as e:
-        #     logging.debug(msg=e.__str__())
-        # try:
-        #     self.module.tcp_connect(self.tcp_server)
-        # except TimeoutExpired as e:
-        #     self._tcp_timeouterr_handler()
-        # except CommandError as e:
-        #     self._tcp_timeouterr_handler()
-
-
-    # def _tcp_commanderr_handler(self):
-    #     logging.debug('Running _tcp_commanderr_handler ...')
-
-    #     try:
-    #         self.module.tcp_close()
-    #     except CommandError as e:
-    #         logging.error(msg=e.__str__())
-        
-    #     try:
-    #         self.module.tcp_connect(self.tcp_server)
-    #     except TimeoutExpired as e:
-    #         logging.error(msg=e.__str__())
-    #         self._tcp_timeouterr_handler()
-    #     except CommandError as e:
-    #         logging.error(msg=e.__str__())
-    #         self._tcp_commanderr_handler()
-
-
-    # def tcp_packet(self, temp=True, *args, **kwargs):
-    #     ''' format data to send on tcp_server '''
-    #     # See ubidots docs: https://ubidots.com/docs/hw/#tcp--udp
-    #     context = ''
-    #     body = '''tracknroll|POST|A1E-YAmgm46yp3XrCtoYWou3dd8pcwfGYU|tracknroll=>temp:{}{}@{}|end'''
-    #     temp = self.sensor.temp_read()
-    #     # pdb.set_trace()
-    #     gps_stat = self.module.gps_stat()
-
-    #     context += '$rssi=' + self.module.signal_strength()
-    #     context += '$gps_stat=' + gps_stat
-
-    #     # _filter lambda func
-    #     _filter = lambda key: key in ('utc_time', 'stat', 'course', 'date', 'time')
-    #     gps_data = self.get_loc(gsmloc_backup=kwargs.get('gsmloc_backup')) # this is a GPSData object
-    #     if gps_data:
-    #         for k,v in gps_data.__dict__.items():
-    #             # filter data to reduce tcp_packet size ('utc_time', 'stat')
-    #             if _filter(k):
-    #                 continue    # do not add on context var
-    #             context += '${}={}'.format(k, v)
-
-    #     return body.format(temp, context, int(now())*1000)
 
     def run(self):
         # Get settings
